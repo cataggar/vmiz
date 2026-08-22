@@ -1,7 +1,6 @@
 # Ubuntu 26.04 images
 
-vmiz has full and core Ubuntu 26.04 build flavors for both supported
-architectures:
+vmiz has full, core, and bare-metal Ubuntu 26.04 build flavors:
 
 | Flavor | vmiz architecture | Ubuntu architecture | Candidate | Default virtual size | Boot/provisioning |
 | --- | --- | --- | --- | --- | --- |
@@ -9,6 +8,10 @@ architectures:
 | full | `aarch64` | `arm64` | `Ubuntu-26.04-aarch64.qcow2` | 5 GiB | systemd, cloud-init, WALinuxAgent |
 | core | `x86_64` | `amd64` | `Ubuntu-26.04-x86_64.core.qcow2` | 3584 MiB | vmizinit, azagent |
 | core | `aarch64` | `arm64` | `Ubuntu-26.04-aarch64.core.qcow2` | 3584 MiB | vmizinit, azagent |
+| baremetal | `aarch64` | `arm64` | `Ubuntu-26.04-aarch64.baremetal.qcow2` | 5 GiB | vmizinit, baked administrator |
+
+Bare metal is `aarch64` only: the kernel it names is published for `arm64`
+alone, because the machines it exists for are.
 
 Only the two full images are currently release assets. Core candidates are
 built, signed, and accepted by a separate protected validation workflow, but
@@ -106,11 +109,12 @@ architecture-specific UKI from both the fallback path
 (`EFI/BOOT/BOOTX64.EFI` or `EFI/BOOT/BOOTAA64.EFI`) and the corresponding
 `EFI/Linux/` path; shim and GRUB are not required for this boot path.
 
-The UKI combines the installed `linux-azure` kernel, its newly generated
-initramfs, and matching `/lib/modules/<release>`. The builder refuses a
-non-Azure active kernel, missing modules, wrong PE architecture, invalid
-signature, missing final UKI, wrong Ubuntu release, backing file, or wrong
-virtual size.
+The UKI combines the installed kernel, its newly generated initramfs, and
+matching `/lib/modules/<release>`. Which kernel is the right one is a property
+of the flavor -- `linux-azure` for full and core, the NVIDIA BaseOS kernel for
+bare metal -- and the builder refuses any other, along with missing modules,
+wrong PE architecture, invalid signature, missing final UKI, wrong Ubuntu
+release, backing file, or wrong virtual size.
 
 The generalized full guest uses:
 
@@ -146,6 +150,52 @@ authorized keys, host keys, and the sentinel must persist across reboot;
 separate instances must not inherit them from the candidate.
 
 `--proxy <url>` reaches the Canonical cloud image and the Ubuntu archive through an HTTP proxy, for a build host with no direct egress. It is named explicitly rather than read from `http_proxy` or `https_proxy`, so a build's egress path is a stated input like every other one and cannot change because of an ambient variable, and it is rejected before anything is downloaded if it is malformed. A proxy carrying a credential is refused, because the credential would have to travel in an argument or an environment variable to get here; debz refuses those on the same grounds. TLS is unaffected: the proxy is asked to `CONNECT`, the session is negotiated end to end with the origin, and the pinned digests and archive signatures still verify the bytes that origin served. The same value is passed to debz, so package download takes the same path the image download does.
+
+### Bare metal
+
+The bare-metal guest is the core guest on a physical machine, and every
+difference follows from one fact: there is no Azure underneath it to be
+provisioned by.
+
+Its UKI selects `vmizinit.azure=off` rather than `auto`, so vmizinit does not
+spend a boot looking for evidence that is never coming. That decision also
+means `azagent` never runs -- and `azagent` is what, on core, creates the
+administrator, generates the SSH host keys, and writes
+`/var/lib/azagent/provisioned`, the sentinel vmizinit waits for before it
+starts `sshd`. Left alone, a bare-metal image would boot correctly and never
+become reachable, with nothing on the network to say why.
+
+So the image is built already holding what provisioning would have delivered.
+The administrator `g` is created at build time from `--authorized-key`, with a
+locked password and passwordless sudo, and the image ships
+`/usr/local/sbin/vmizinit-access`: the replacement access provider vmizinit
+documents for exactly this case, started without waiting on a sentinel because
+it brings its own credential path. It generates the host keys on first boot,
+creates `/run/sshd` -- which vmizinit does only on the path it replaces -- and
+execs `sshd -D -e`. Networking needs no configuration: vmizinit runs its own
+DHCP client on the first non-loopback interface.
+
+`validateNoBakedIdentity` refuses SSH host keys for every flavor, because they
+must differ per machine. It refuses authorized keys only where identity
+arrives at boot, which is what separates bare metal from the two Azure
+flavors. A bare-metal build without a key is refused outright: an image nobody
+can log in to is not a successful build.
+
+The initramfs is the highest-risk part of the flavor and is checked as such.
+An Azure image's dependency-pruned initramfs carries `hv_netvsc` and `sd_mod`;
+a machine whose root is behind NVMe and whose management NIC is a USB-attached
+Realtek has neither. The image sets `MODULES=most` and names `nvme`,
+`nvme_core`, `xhci_hcd`, `xhci_pci`, `usbnet`, `mii`, and `r8152` explicitly,
+and then the builder reads the initramfs it is about to seal into the UKI --
+the bytes that will boot, not the configuration that asked for them -- and
+fails unless `nvme` and `r8152` are in it. Both halves of a concatenated
+initramfs are searched; an image whose compressed half cannot be read fails
+closed.
+
+`--raw-output` writes a second copy of the validated image with no container
+format, for writing to a disk with `dd`. The QCOW2 remains the artifact every
+gate is applied to; the raw copy is made from it afterwards, so the two are
+the same guest bytes.
 
 ## Local build
 
@@ -250,6 +300,25 @@ sudo -E zig build \
   generalized-ubuntu2604 -- \
   --provenance-dir artifacts/aarch64-core/internal-provenance \
   --output artifacts/aarch64-core/Ubuntu-26.04-aarch64.core.qcow2 \
+  --uki-signing-certificate test.pem \
+  --uki-signing-certificate-sha256 <canonical-DER-SHA-256> \
+  --uki-signing-key test.key
+```
+
+Bare metal is built for `aarch64` only, on an `aarch64` host: the guest tools
+run in an offline root, so the build host's architecture must match the
+guest's. The key is required, and `--raw-output` is what a disk gets written
+from:
+
+```console
+sudo -E zig build \
+  -Dubuntu2604-arch=aarch64 \
+  -Dubuntu2604-flavor=baremetal \
+  generalized-ubuntu2604 -- \
+  --provenance-dir artifacts/aarch64-baremetal/internal-provenance \
+  --output artifacts/aarch64-baremetal/Ubuntu-26.04-aarch64.baremetal.qcow2 \
+  --raw-output artifacts/aarch64-baremetal/Ubuntu-26.04-aarch64.baremetal.raw \
+  --authorized-key ~/.ssh/id_ed25519.pub \
   --uki-signing-certificate test.pem \
   --uki-signing-certificate-sha256 <canonical-DER-SHA-256> \
   --uki-signing-key test.key

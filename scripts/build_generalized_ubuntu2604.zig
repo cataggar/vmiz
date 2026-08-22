@@ -44,12 +44,23 @@ const default_virtual_size: u64 = 5 * 1024 * 1024 * 1024;
 // than full while the fresh debz root leaves at least this much writable room.
 const core_virtual_size: u64 = 3584 * 1024 * 1024;
 const core_minimum_root_free_bytes: u64 = 768 * 1024 * 1024;
+// Bare metal carries the NVIDIA BaseOS kernel's modules -- about 183 MB
+// installed against core's 3.5 GiB -- and an initramfs built with
+// `MODULES=most` rather than a dependency-pruned one, because the machine it
+// boots is not the virtual machine core was measured on.
+const baremetal_virtual_size: u64 = 5 * 1024 * 1024 * 1024;
 const source_max_size: u64 = 2 * 1024 * 1024 * 1024;
 const manifest_max_size: u64 = 256 * 1024;
 const sums_max_size: u64 = 64 * 1024;
 const signature_max_size: u64 = 16 * 1024;
 const public_key_max_size: usize = 4 * 1024;
 const keyring_max_size: usize = 1024 * 1024;
+
+/// The Ubuntu kernel flavors this builder knows how to boot. The suffix is
+/// how the finished root is searched for its kernel, so naming the wrong one
+/// fails the build rather than shipping a kernel nobody asked for.
+const azure_kernel_suffix = "-azure";
+const nvidia_bos_kernel_suffix = "-nvidia-bos-64k";
 
 const Architecture = enum {
     x86_64,
@@ -65,10 +76,16 @@ const Architecture = enum {
 const Flavor = enum {
     full,
     core,
+    /// `core` aimed at a physical machine instead of an Azure VM: the NVIDIA
+    /// BaseOS kernel, an initramfs that carries the drivers this hardware
+    /// actually needs, and an administrator key baked in, because bare metal
+    /// has no OVF media to receive one from at boot.
+    baremetal,
 
     fn parse(value: []const u8) ?Flavor {
         if (std.mem.eql(u8, value, "full")) return .full;
         if (std.mem.eql(u8, value, "core")) return .core;
+        if (std.mem.eql(u8, value, "baremetal")) return .baremetal;
         return null;
     }
 
@@ -76,6 +93,38 @@ const Flavor = enum {
         return switch (self) {
             .full => default_virtual_size,
             .core => core_virtual_size,
+            .baremetal => baremetal_virtual_size,
+        };
+    }
+
+    /// Whether the root is built from scratch with debz rather than inherited
+    /// from Canonical's cloud root. This, not the flavor name, is what the
+    /// build's structure actually turns on.
+    fn freshRoot(self: Flavor) bool {
+        return self != .full;
+    }
+
+    /// Whether the image expects to find Azure underneath it. Bare metal has
+    /// no IMDS, no OVF media, and no provisioning agent to wait for.
+    fn azure(self: Flavor) bool {
+        return self != .baremetal;
+    }
+
+    /// The Ubuntu kernel flavor this image boots. The builder refuses any
+    /// other kernel, so this is also the assertion that the right one was
+    /// installed.
+    fn kernelSuffix(self: Flavor) []const u8 {
+        return switch (self) {
+            .full, .core => azure_kernel_suffix,
+            .baremetal => nvidia_bos_kernel_suffix,
+        };
+    }
+
+    fn debzPackages(self: Flavor) []const []const u8 {
+        return switch (self) {
+            .full => &full_debz_packages,
+            .core => &core_debz_packages,
+            .baremetal => &baremetal_debz_packages,
         };
     }
 };
@@ -152,18 +201,30 @@ const Profile = struct {
     root_partition_type_guid: guid.Guid,
 
     fn outputFor(self: *const Profile, flavor: Flavor) []const u8 {
-        if (flavor == .full) return self.output;
-        return switch (self.architecture) {
-            .x86_64 => "Ubuntu-26.04-x86_64.core.qcow2",
-            .aarch64 => "Ubuntu-26.04-aarch64.core.qcow2",
+        return switch (flavor) {
+            .full => self.output,
+            .core => switch (self.architecture) {
+                .x86_64 => "Ubuntu-26.04-x86_64.core.qcow2",
+                .aarch64 => "Ubuntu-26.04-aarch64.core.qcow2",
+            },
+            .baremetal => switch (self.architecture) {
+                .x86_64 => "Ubuntu-26.04-x86_64.baremetal.qcow2",
+                .aarch64 => "Ubuntu-26.04-aarch64.baremetal.qcow2",
+            },
         };
     }
 
     fn workDirFor(self: *const Profile, flavor: Flavor) []const u8 {
-        if (flavor == .full) return self.work_dir;
-        return switch (self.architecture) {
-            .x86_64 => ".scratch/ubuntu2604-x86_64-core",
-            .aarch64 => ".scratch/ubuntu2604-aarch64-core",
+        return switch (flavor) {
+            .full => self.work_dir,
+            .core => switch (self.architecture) {
+                .x86_64 => ".scratch/ubuntu2604-x86_64-core",
+                .aarch64 => ".scratch/ubuntu2604-aarch64-core",
+            },
+            .baremetal => switch (self.architecture) {
+                .x86_64 => ".scratch/ubuntu2604-x86_64-baremetal",
+                .aarch64 => ".scratch/ubuntu2604-aarch64-baremetal",
+            },
         };
     }
 };
@@ -219,11 +280,35 @@ const core_debz_packages = [_][]const u8{
     "openssh-server",
     "sudo",
 };
-const max_debz_packages = core_debz_packages.len;
+// There is no `linux-nvidia-bos` meta package in the pinned snapshot -- the
+// only ones published are for builds that postdate it -- so the versioned
+// binary package is named directly. That name *is* the kernel release, which
+// is why no separate version pin is needed.
+const baremetal_kernel_release = "7.0.0-2015" ++ nvidia_bos_kernel_suffix;
+const baremetal_image_package = "linux-image-" ++ baremetal_kernel_release;
+const baremetal_modules_package = "linux-modules-" ++ baremetal_kernel_release;
+const baremetal_debz_packages = [_][]const u8{
+    "ubuntu-minimal",
+    baremetal_image_package,
+    baremetal_modules_package,
+    "openssh-server",
+    "sudo",
+};
+const max_debz_packages = baremetal_debz_packages.len;
 
 const core_required_packages = [_][]const u8{
     "ubuntu-minimal",
     "linux-azure",
+    "openssh-server",
+    "openssh-client",
+    "sudo",
+    "ca-certificates",
+};
+
+const baremetal_required_packages = [_][]const u8{
+    "ubuntu-minimal",
+    baremetal_image_package,
+    baremetal_modules_package,
     "openssh-server",
     "openssh-client",
     "sudo",
@@ -235,6 +320,17 @@ const core_forbidden_packages = [_][]const u8{
     "walinuxagent",
     "ubuntu-server",
     "ubuntu-server-minimal",
+};
+
+// Bare metal forbids everything core does, and `linux-azure` besides: pulling
+// it in would leave two kernels in `/boot` and make the release the UKI is
+// built from ambiguous.
+const baremetal_forbidden_packages = [_][]const u8{
+    "cloud-init",
+    "walinuxagent",
+    "ubuntu-server",
+    "ubuntu-server-minimal",
+    "linux-azure",
 };
 
 const core_required_paths = [_][]const u8{
@@ -276,6 +372,57 @@ const core_azagent_config =
     "ResourceDisk.EnableSwap=n\n" ++
     "DataDisk.Mount=y\n";
 
+// An Azure VM's root is virtio or SCSI and its NIC is netvsc, so a
+// dependency-pruned initramfs built in that context carries neither the NVMe
+// driver this machine's root lives behind nor the USB-attached Realtek NIC it
+// is reached through. `MODULES=most` is the safe default; the explicit list
+// below then states the four that must be there regardless of what `most`
+// decides, so a change in that heuristic cannot silently strand the machine.
+const baremetal_initramfs_conf =
+    "MODULES=most\n" ++
+    "BUSYBOX=auto\n" ++
+    "COMPRESS=zstd\n" ++
+    "DEVICE=\n" ++
+    "NFS=no\n" ++
+    "RUNSIZE=10%\n";
+
+// `r8152` is the Realtek RTL8153 the management NIC actually is -- it is USB
+// attached, not PCI, so the USB host controller and the usbnet layer have to
+// come with it.
+const baremetal_initramfs_modules =
+    "nvme\n" ++
+    "nvme_core\n" ++
+    "xhci_hcd\n" ++
+    "xhci_pci\n" ++
+    "usbnet\n" ++
+    "mii\n" ++
+    "r8152\n";
+
+/// The one account a bare-metal image ships with.
+const baremetal_admin_user = "g";
+
+/// vmizinit's documented replacement for its default access provider.
+const baremetal_access_provider_path = "/usr/local/sbin/vmizinit-access";
+
+// vmizinit starts sshd only once provisioning has written its sentinel,
+// because on Azure provisioning is what installs the administrator's key: an
+// sshd started earlier listens on an image nobody can authenticate to. Bare
+// metal inverts that -- the key is baked in at build time, so the wait is for
+// something that already happened, and azagent, which would otherwise both
+// write the sentinel and generate the host keys, never runs.
+//
+// This is the extension point vmizinit documents for exactly that case: a
+// provider that brings its own credential path and is started without waiting.
+// Host keys are still not baked, because they must differ per machine, so they
+// are generated here on first boot. `/run/sshd` is created here too: vmizinit
+// creates it only on the path this replaces.
+const baremetal_access_provider =
+    "#!/bin/sh\n" ++
+    "set -e\n" ++
+    "[ -f /etc/ssh/ssh_host_ed25519_key ] || /usr/bin/ssh-keygen -A\n" ++
+    "mkdir -p /run/sshd\n" ++
+    "exec /usr/sbin/sshd -D -e\n";
+
 const Args = struct {
     architecture: ?Architecture = null,
     flavor: Flavor = .full,
@@ -294,19 +441,23 @@ const Args = struct {
     signing_command_arg: ?[]const u8 = null,
     uki_stub: ?[]const u8 = null,
     proxy: ?[]const u8 = null,
+    authorized_key: ?[]const u8 = null,
+    raw_output: ?[]const u8 = null,
     preflight_only: bool = false,
 };
 
 const help =
-    \\Usage: zig build generalized-ubuntu2604 -Dubuntu2604-arch=<x86_64|aarch64> -Dubuntu2604-flavor=<full|core> -- [options]
-    \\  --flavor <full|core>                    image flavor (default full)
+    \\Usage: zig build generalized-ubuntu2604 -Dubuntu2604-arch=<x86_64|aarch64> -Dubuntu2604-flavor=<full|core|baremetal> -- [options]
+    \\  --flavor <full|core|baremetal>          image flavor (default full)
     \\  --source <path>                         verified local Canonical .img
     \\  --output <path>                         output QCOW2
     \\  --work-dir <path>                       persistent download/work cache
     \\  --provenance-dir <path>                 release provenance sidecars
-    \\  --size <size>                           virtual size (full 5G, core 3584M)
-    \\  --vmizinit <path>                       static guest PID 1 (core only)
-    \\  --azagent <path>                        static guest provisioning agent (core only)
+    \\  --size <size>                           virtual size (full 5G, core 3584M, baremetal 5G)
+    \\  --vmizinit <path>                       static guest PID 1 (core, baremetal)
+    \\  --azagent <path>                        static guest provisioning agent (core, baremetal)
+    \\  --authorized-key <path>                 administrator public key (baremetal only)
+    \\  --raw-output <path>                     additional raw copy, for writing to a disk
     \\  --proxy <url>                           reach the archive through this HTTP proxy
     \\  --uki-signing-certificate <path>        Secure Boot certificate
     \\  --uki-signing-certificate-sha256 <hex>  DER certificate SHA-256
@@ -531,6 +682,14 @@ fn parseArgs(argv: []const []const u8) !Args {
             // fails before the build downloads anything.
             _ = try artifact_pipeline.parseProxy(argv[i]);
             args.proxy = argv[i];
+        } else if (std.mem.eql(u8, arg, "--authorized-key")) {
+            i += 1;
+            if (i == argv.len) return error.MissingArgument;
+            args.authorized_key = argv[i];
+        } else if (std.mem.eql(u8, arg, "--raw-output")) {
+            i += 1;
+            if (i == argv.len) return error.MissingArgument;
+            args.raw_output = argv[i];
         } else if (std.mem.eql(u8, arg, "--preflight-only")) {
             args.preflight_only = true;
         } else if (std.mem.eql(u8, arg, "--help")) {
@@ -541,7 +700,37 @@ fn parseArgs(argv: []const []const u8) !Args {
 
     if (!args.size_explicit) args.size = args.flavor.defaultSize();
     if (args.size < args.flavor.defaultSize()) return error.ImageTooSmall;
+    // The key is the only way into a bare-metal image, so a missing one is a
+    // build that produces an unreachable machine. It is equally an error to
+    // offer a key to a flavor that would refuse to bake it: silently ignoring
+    // it would leave the caller believing an image is reachable when it is not.
+    if (args.flavor == .baremetal and args.authorized_key == null)
+        return error.AuthorizedKeyRequired;
+    if (args.flavor != .baremetal and args.authorized_key != null)
+        return error.AuthorizedKeyNotSupported;
     return args;
+}
+
+/// Reads and sanity-checks an OpenSSH public key given on the command line.
+///
+/// The check is deliberately shallow -- one line, a known key type, no
+/// terminator hiding a second entry -- because its purpose is to catch the
+/// path being wrong (a private key, a whole `known_hosts`, an empty file), not
+/// to re-verify the key material.
+fn readAuthorizedKey(allocator: Allocator, io: Io, path: []const u8) ![]u8 {
+    const bytes = Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return error.AuthorizedKeyMissing,
+        else => return err,
+    };
+    defer allocator.free(bytes);
+    const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidAuthorizedKey;
+    if (std.mem.indexOfAny(u8, trimmed, "\r\n") != null) return error.InvalidAuthorizedKey;
+    const accepted = [_][]const u8{ "ssh-ed25519 ", "ssh-rsa ", "ecdsa-sha2-nistp", "sk-ssh-ed25519@", "sk-ecdsa-sha2-nistp" };
+    for (&accepted) |prefix| {
+        if (std.mem.startsWith(u8, trimmed, prefix)) return allocator.dupe(u8, trimmed);
+    }
+    return error.InvalidAuthorizedKey;
 }
 
 fn signingConfig(args: Args) !uki_signing.Config {
@@ -1039,6 +1228,17 @@ fn requiredPackages(flavor: Flavor) []const []const u8 {
     return switch (flavor) {
         .full => &.{ "linux-azure", "walinuxagent", "cloud-init", "openssh-server" },
         .core => &core_required_packages,
+        .baremetal => &baremetal_required_packages,
+    };
+}
+
+/// Packages whose presence in the finished closure is a build failure. `full`
+/// inherits Canonical's cloud root and has no such list.
+fn forbiddenPackages(flavor: Flavor) []const []const u8 {
+    return switch (flavor) {
+        .full => &.{},
+        .core => &core_forbidden_packages,
+        .baremetal => &baremetal_forbidden_packages,
     };
 }
 
@@ -1056,12 +1256,10 @@ fn validateExactLock(bytes: []const u8, profile: *const Profile, flavor: Flavor)
         .aarch64 => "\tamd64\n",
     };
     if (std.mem.indexOf(u8, bytes, foreign_arch) != null) return error.ForeignArchitecturePackage;
-    if (flavor == .core) {
-        for (&core_forbidden_packages) |package| {
-            const needle = try std.fmt.allocPrint(std.testing.allocator, "{s}\t", .{package});
-            defer std.testing.allocator.free(needle);
-            if (std.mem.indexOf(u8, bytes, needle) != null) return error.ForbiddenCorePackage;
-        }
+    for (forbiddenPackages(flavor)) |package| {
+        const needle = try std.fmt.allocPrint(std.testing.allocator, "{s}\t", .{package});
+        defer std.testing.allocator.free(needle);
+        if (std.mem.indexOf(u8, bytes, needle) != null) return error.ForbiddenCorePackage;
     }
 }
 
@@ -1084,12 +1282,10 @@ fn validateExactLockRuntime(
         .aarch64 => "\tamd64\n",
     };
     if (std.mem.indexOf(u8, bytes, foreign_arch) != null) return error.ForeignArchitecturePackage;
-    if (flavor == .core) {
-        for (&core_forbidden_packages) |package| {
-            const needle = try std.fmt.allocPrint(allocator, "{s}\t", .{package});
-            defer allocator.free(needle);
-            if (std.mem.indexOf(u8, bytes, needle) != null) return error.ForbiddenCorePackage;
-        }
+    for (forbiddenPackages(flavor)) |package| {
+        const needle = try std.fmt.allocPrint(allocator, "{s}\t", .{package});
+        defer allocator.free(needle);
+        if (std.mem.indexOf(u8, bytes, needle) != null) return error.ForbiddenCorePackage;
     }
 }
 
@@ -1355,6 +1551,16 @@ fn ukiCmdline(
             "root=PARTUUID={s} init=/sbin/vmizinit vmizinit.mode=persistent vmizinit.azure=auto console=tty0 {s}",
             .{ guid.formatLower(&root_guid_text, root_guid), profile.serial_console },
         ),
+        // `azure=off` rather than an omitted option: the default is `auto`,
+        // which probes for evidence that is never coming and then decides the
+        // same thing more slowly. The serial console is kept alongside
+        // `tty0` because this firmware's console has not been confirmed, and
+        // a boot nobody can watch is a boot nobody can diagnose.
+        .baremetal => std.fmt.allocPrint(
+            allocator,
+            "root=PARTUUID={s} init=/sbin/vmizinit vmizinit.mode=persistent vmizinit.azure=off console=tty0 {s}",
+            .{ guid.formatLower(&root_guid_text, root_guid), profile.serial_console },
+        ),
     };
 }
 
@@ -1469,7 +1675,7 @@ fn validateNativeBootArtifacts(
     defer allocator.free(modules_path);
     const modules = try root.discover(modules_path, "*");
     defer root.freeFound(modules);
-    if (modules.len == 0) return error.AzureKernelModulesMissing;
+    if (modules.len == 0) return error.ExpectedKernelModulesMissing;
     const modules_dep_path = try std.fmt.allocPrint(allocator, "{s}/modules.dep", .{modules_path});
     defer allocator.free(modules_dep_path);
     const modules_dep = root.inspect(modules_dep_path) catch |err| switch (err) {
@@ -1542,7 +1748,7 @@ fn customizeOfflineRoot(
 ) ![]u8 {
     var root = try offline_root.Root.init(allocator, io, root_path, .{});
     defer root.deinit();
-    const release_name = try root.activeKernelRelease();
+    const release_name = try root.activeKernelRelease(flavor.kernelSuffix());
     errdefer allocator.free(release_name);
     try root.validateArchitecture(switch (profile.architecture) {
         .x86_64 => .x86_64,
@@ -1616,10 +1822,24 @@ fn customizeOfflineRoot(
                 .{ .write_file = .{ .path = "/etc/resolv.conf", .source = .{ .inline_bytes = "" } } },
             });
         },
+        .baremetal => {
+            try root.apply(&.{
+                .{ .create_directory = .{ .path = "/etc/ssh/sshd_config.d", .mode = 0o755 } },
+                .{ .create_directory = .{ .path = "/etc/initramfs-tools", .mode = 0o755 } },
+                .{ .create_directory = .{ .path = "/usr/local/sbin", .mode = 0o755 } },
+                .{ .create_directory = .{ .path = "/var/lib/vmiz", .mode = 0o755 } },
+                .{ .write_file = .{ .path = "/etc/ssh/sshd_config.d/10-vmizinit.conf", .source = .{ .inline_bytes = core_ssh_config }, .mode = 0o600 } },
+                .{ .write_file = .{ .path = "/etc/waagent.conf", .source = .{ .inline_bytes = core_azagent_config } } },
+                .{ .write_file = .{ .path = "/etc/resolv.conf", .source = .{ .inline_bytes = "" } } },
+                .{ .write_file = .{ .path = "/etc/initramfs-tools/initramfs.conf", .source = .{ .inline_bytes = baremetal_initramfs_conf } } },
+                .{ .write_file = .{ .path = "/etc/initramfs-tools/modules", .source = .{ .inline_bytes = baremetal_initramfs_modules } } },
+                .{ .write_file = .{ .path = baremetal_access_provider_path, .source = .{ .inline_bytes = baremetal_access_provider }, .mode = 0o755 } },
+            });
+        },
     }
 
     try validateNativeBootArtifacts(allocator, &root, release_name);
-    if (flavor == .core) try validateCoreKernelModules(allocator, &root, release_name);
+    if (flavor.freshRoot()) try validateCoreKernelModules(allocator, &root, release_name);
 
     var initramfs = try runOfflineCommand(&executor, .{ .update_initramfs = release_name });
     defer initramfs.deinit(allocator);
@@ -1738,7 +1958,7 @@ fn generalizationPolicy(flavor: Flavor) vmiz.os_customization.GeneralizationPoli
             .clear_random_seed = false,
             .remove_users = &.{"ubuntu"},
         } },
-        .core => .{ .azure = .{ .remove_users = &.{"ubuntu"} } },
+        .core, .baremetal => .{ .azure = .{ .remove_users = &.{"ubuntu"} } },
     };
 }
 
@@ -1841,10 +2061,20 @@ fn requireRootPathAbsent(filesystem: *const vmiz.ext4_mountless.FileSystem, path
     return error.ForbiddenCorePath;
 }
 
+/// Walks the finished root for identity that must not be built into an image.
+///
+/// Host keys are rejected for every flavor: they must differ per machine, and
+/// an image that ships one hands every machine built from it the same
+/// identity. Authorized keys are rejected only where identity arrives at boot
+/// -- on Azure, from OVF media, which makes a baked key both unnecessary and a
+/// way for one to outlive the provisioning that was supposed to replace it.
+/// Bare metal has no such media and no agent to read it, so the administrator
+/// key has to be in the image; that is the whole difference.
 fn validateNoBakedIdentity(
     allocator: Allocator,
     filesystem: *const vmiz.ext4_mountless.FileSystem,
     directory: []const u8,
+    flavor: Flavor,
 ) !void {
     const entries = filesystem.list(allocator, directory, 100_000) catch |err| switch (err) {
         error.PathNotFound => return,
@@ -1853,9 +2083,10 @@ fn validateNoBakedIdentity(
     defer allocator.free(entries);
     for (entries) |entry| {
         const name = std.fs.path.basename(entry.path);
-        if (std.mem.eql(u8, name, "authorized_keys") or std.mem.startsWith(u8, name, "ssh_host_"))
+        if (std.mem.startsWith(u8, name, "ssh_host_")) return error.BakedIdentityState;
+        if (flavor.azure() and std.mem.eql(u8, name, "authorized_keys"))
             return error.BakedIdentityState;
-        if (entry.kind == .directory) try validateNoBakedIdentity(allocator, filesystem, entry.path);
+        if (entry.kind == .directory) try validateNoBakedIdentity(allocator, filesystem, entry.path, flavor);
     }
 }
 
@@ -1864,10 +2095,18 @@ fn validateCoreRoot(
     io: Io,
     filesystem: *const vmiz.ext4_mountless.FileSystem,
     profile: *const Profile,
+    flavor: Flavor,
     evidence: []const DebzEvidence,
 ) !void {
-    if (evidence.len != core_debz_packages.len) return error.InvalidDebzEvidence;
+    if (evidence.len != flavor.debzPackages().len) return error.InvalidDebzEvidence;
     for (&core_required_paths) |path| try requireRootPath(filesystem, path);
+    if (flavor == .baremetal) {
+        // Without this the machine boots and never becomes reachable: vmizinit
+        // would fall back to sshd, which waits for a provisioning sentinel that
+        // nothing on bare metal ever writes.
+        try requireRootPath(filesystem, baremetal_access_provider_path);
+        try requireRootPath(filesystem, "/etc/initramfs-tools/initramfs.conf");
+    }
     for (&core_forbidden_paths) |path| try requireRootPathAbsent(filesystem, path);
     const sbin = try filesystem.readLink(allocator, "/sbin", 1024);
     defer allocator.free(sbin);
@@ -1894,7 +2133,7 @@ fn validateCoreRoot(
         defer allocator.free(seed);
         if (seed.len != 0) return error.BakedIdentityState;
     }
-    try validateNoBakedIdentity(allocator, filesystem, "/");
+    try validateNoBakedIdentity(allocator, filesystem, "/", flavor);
 
     const ssh_config = try filesystem.read(allocator, "/etc/ssh/sshd_config.d/10-vmizinit.conf", 64 * 1024);
     defer allocator.free(ssh_config);
@@ -1986,6 +2225,7 @@ fn customizeRootWithDebz(
     vmizinit_path: ?[]const u8,
     azagent_path: ?[]const u8,
     proxy: ?[]const u8,
+    authorized_key: ?[]const u8,
 ) !DebzCustomization {
     const extraction = try std.fs.path.join(allocator, &.{ work_dir, "official-root" });
     defer allocator.free(extraction);
@@ -2019,7 +2259,7 @@ fn customizeRootWithDebz(
     var trusted = try materializeTrustedKeyring(allocator, io, trusted_keyring, external_keyring);
     defer trusted.deinit(allocator);
     const absolute_keyring = trusted.path;
-    if (flavor == .core) {
+    if (flavor.freshRoot()) {
         try Dir.cwd().deleteTree(io, current);
         try Dir.cwd().createDirPath(io, current);
     }
@@ -2060,10 +2300,7 @@ fn customizeRootWithDebz(
     const config_inputs = [_][]const u8{absolute_source_config};
     const keyring_inputs = [_][]const u8{absolute_keyring};
 
-    const debz_packages: []const []const u8 = if (flavor == .full)
-        &full_debz_packages
-    else
-        &core_debz_packages;
+    const debz_packages: []const []const u8 = flavor.debzPackages();
     var evidence: [max_debz_packages]DebzEvidence = undefined;
     var evidence_count: usize = 0;
     errdefer {
@@ -2072,9 +2309,9 @@ fn customizeRootWithDebz(
 
     for (debz_packages, 0..) |package, index| {
         const installed_baseline: package_family.InstalledBaselinePolicy =
-            if (flavor == .core and index == 0) .none else .require_locked;
+            if (flavor.freshRoot() and index == 0) .none else .require_locked;
         const apply_operation: package_family.Operation =
-            if (flavor == .core and index == 0) .create else .customize;
+            if (flavor.freshRoot() and index == 0) .create else .customize;
         const packages = [_][]const u8{package};
         const transaction_dir = try std.fmt.allocPrint(allocator, "{s}/debz-{s}", .{ work_dir, package });
         defer allocator.free(transaction_dir);
@@ -2240,7 +2477,20 @@ fn customizeRootWithDebz(
         }) |path| try removeIfPresent(&native_root.filesystem, path);
     }
     try native_root.filesystem.generalize(generalizationPolicy(flavor));
-    if (flavor == .core) {
+    // After generalization, which is what removes accounts: an administrator
+    // created before it would be taken straight back out again.
+    if (authorized_key) |key| {
+        try native_root.filesystem.applyCustomization(.{
+            .users = &.{.{
+                .name = baremetal_admin_user,
+                .shell = "/bin/bash",
+                .password = .locked,
+                .ssh_authorized_keys = &.{key},
+                .passwordless_sudo = true,
+            }},
+        }, 0);
+    }
+    if (flavor.freshRoot()) {
         const vmizinit = vmizinit_path orelse return error.CoreGuestArtifactsRequired;
         const azagent = azagent_path orelse return error.CoreGuestArtifactsRequired;
         try injectCoreGuest(
@@ -2257,6 +2507,7 @@ fn customizeRootWithDebz(
             io,
             &native_root.filesystem,
             profile,
+            flavor,
             evidence[0..evidence_count],
         );
     }
@@ -2268,7 +2519,7 @@ fn customizeRootWithDebz(
     }
     const filesystem_info = try native_root.finish();
     const root_free_bytes = @as(u64, filesystem_info.free_block_count) * 4096;
-    if (flavor == .core and root_free_bytes < core_minimum_root_free_bytes)
+    if (flavor.freshRoot() and root_free_bytes < core_minimum_root_free_bytes)
         return error.CoreRootFreeSpaceTooSmall;
     return .{
         .root_path = current,
@@ -2594,19 +2845,19 @@ fn extractNativeBootInputs(
     for (boot_entries) |entry| {
         const name = std.fs.path.basename(entry.path);
         if (std.mem.startsWith(u8, name, "vmlinuz-") and
-            std.mem.endsWith(u8, name, "-azure"))
+            std.mem.endsWith(u8, name, flavor.kernelSuffix()))
         {
-            if (release_name != null) return error.MultipleAzureKernels;
+            if (release_name != null) return error.MultipleExpectedKernels;
             release_name = try allocator.dupe(u8, name["vmlinuz-".len..]);
         }
     }
-    const kernel_release = release_name orelse return error.AzureKernelMissing;
+    const kernel_release = release_name orelse return error.ExpectedKernelMissing;
     errdefer allocator.free(kernel_release);
     const modules_guest = try std.fmt.allocPrint(allocator, "/lib/modules/{s}", .{kernel_release});
     defer allocator.free(modules_guest);
     const modules = try native_root.filesystem.list(allocator, modules_guest, 4096);
     defer allocator.free(modules);
-    if (modules.len == 0) return error.AzureKernelModulesMissing;
+    if (modules.len == 0) return error.ExpectedKernelModulesMissing;
 
     try Dir.cwd().deleteTree(io, extract_dir);
     try Dir.cwd().createDirPath(io, extract_dir);
@@ -2618,6 +2869,8 @@ fn extractNativeBootInputs(
     defer allocator.free(kernel);
     const initrd = try native_root.filesystem.read(allocator, initrd_guest, 256 * 1024 * 1024);
     defer allocator.free(initrd);
+    if (flavor == .baremetal)
+        try requireInitramfsModules(allocator, initrd, &baremetal_required_initramfs_modules);
     const os_release = try native_root.filesystem.read(allocator, "/usr/lib/os-release", 64 * 1024);
     defer allocator.free(os_release);
     const kernel_host = try std.fmt.allocPrint(allocator, "{s}/vmlinuz-{s}", .{ extract_dir, kernel_release });
@@ -2630,6 +2883,107 @@ fn extractNativeBootInputs(
     try Dir.cwd().writeFile(io, .{ .sub_path = initrd_host, .data = initrd });
     try Dir.cwd().writeFile(io, .{ .sub_path = os_release_host, .data = os_release });
     return kernel_release;
+}
+
+/// The drivers without which the machine cannot find its root or be reached.
+///
+/// Named separately from `/etc/initramfs-tools/modules` because that file is a
+/// request and this is the verification: `MODULES=most` is a heuristic, and an
+/// initramfs missing either of these boots into a machine that either cannot
+/// mount root or never appears on the network -- two failures that look
+/// identical from outside and are diagnosable only at the BMC console.
+const baremetal_required_initramfs_modules = [_][]const u8{ "nvme", "r8152" };
+
+/// Fails unless every named module is inside the built initramfs.
+///
+/// The image is the concatenation an initramfs may be: any number of
+/// uncompressed early cpio archives, then the compressed main archive. The
+/// leading archives are walked directly; whatever follows them is decompressed
+/// and walked the same way. Reading the image the builder is about to seal into
+/// the UKI, rather than the configuration that asked for it, is the point --
+/// the question is what the machine will boot, not what it was told to build.
+fn requireInitramfsModules(
+    allocator: Allocator,
+    image: []const u8,
+    required: []const []const u8,
+) !void {
+    const found = try allocator.alloc(bool, required.len);
+    defer allocator.free(found);
+    @memset(found, false);
+
+    var early = vmiz.cpio.Reader.init(image);
+    try scanCpioForModules(&early, required, found);
+    if (early.offset < image.len) {
+        const remainder = image[early.offset..];
+        if (remainder.len < 4 or
+            std.mem.readInt(u32, remainder[0..4], .little) != vmiz.zstd.zstd_magic)
+            return error.UnreadableInitramfs;
+        const decoded = vmiz.zstd.decodeAlloc(allocator, remainder) catch
+            return error.UnreadableInitramfs;
+        defer allocator.free(decoded.bytes);
+        var payload = vmiz.cpio.Reader.init(decoded.bytes);
+        try scanCpioForModules(&payload, required, found);
+    }
+
+    for (found, required) |present, name| {
+        if (!present) {
+            std.debug.print("[ubuntu2604] initramfs is missing {s}\n", .{name});
+            return error.InitramfsModuleMissing;
+        }
+    }
+}
+
+fn scanCpioForModules(
+    reader: *vmiz.cpio.Reader,
+    required: []const []const u8,
+    found: []bool,
+) !void {
+    while (reader.next() catch return) |entry| {
+        const name = std.fs.path.basename(entry.path);
+        // `.ko`, or `.ko` plus whatever the distribution compresses modules
+        // with -- `.ko.zst` on Ubuntu today, which is not a promise.
+        const stem = if (std.mem.indexOf(u8, name, ".ko")) |at| name[0..at] else continue;
+        for (required, 0..) |candidate, index| {
+            if (std.mem.eql(u8, stem, candidate)) found[index] = true;
+        }
+    }
+}
+
+/// Writes the validated image's guest bytes out again, uncompressed.
+///
+/// A QCOW2 is the artifact everything else here validates, and it stays that:
+/// this is a second copy, produced only after the first has passed every gate,
+/// for the one consumer that cannot read the format -- `dd` onto a disk. Going
+/// through `vmiz.Image` rather than a converter keeps the two copies provably
+/// the same bytes, and keeps the promise that this builder shells out to
+/// nothing. It is staged and renamed for the same reason the QCOW2 is: a copy
+/// interrupted partway through must not be left at the name something else is
+/// about to write to a disk.
+fn writeRawCopy(
+    allocator: Allocator,
+    io: Io,
+    qcow2_path: []const u8,
+    raw_path: []const u8,
+) !void {
+    const staged = try std.fmt.allocPrint(allocator, "{s}.vmiz-raw-stage", .{raw_path});
+    defer allocator.free(staged);
+    Dir.cwd().deleteFile(io, staged) catch {};
+    errdefer Dir.cwd().deleteFile(io, staged) catch {};
+
+    try copyNativeImage(allocator, io, qcow2_path, staged, .raw);
+
+    var written = try vmiz.Image.openPathReadOnlyStandalone(io, staged);
+    const written_format = written.format;
+    const written_size = written.virtual_size;
+    written.close(io);
+    if (written_format != .raw) return error.InvalidRawCopy;
+
+    var source = try vmiz.Image.openPathReadOnlyStandalone(io, qcow2_path);
+    const source_size = source.virtual_size;
+    source.close(io);
+    if (written_size != source_size) return error.InvalidRawCopy;
+
+    try Dir.cwd().rename(staged, Dir.cwd(), raw_path, io);
 }
 
 fn espPartition(partitions: []const vmiz.gpt.PartitionEntry) !vmiz.gpt.PartitionEntry {
@@ -2721,6 +3075,13 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     const profile = profileFor(architecture);
+    // The NVIDIA BaseOS kernel is published for arm64 alone, because the
+    // machines it exists for are arm64. Saying so here turns a confusing
+    // package-resolution failure hours into the build into an immediate one.
+    if (args.flavor == .baremetal and architecture != .aarch64) {
+        std.debug.print("error: the baremetal flavor is aarch64 only\n", .{});
+        std.process.exit(1);
+    }
     const work_dir = args.work_dir orelse profile.workDirFor(args.flavor);
     const output = args.output orelse profile.outputFor(args.flavor);
     try Dir.cwd().createDirPath(io, work_dir);
@@ -2790,7 +3151,7 @@ pub fn main(init: std.process.Init) !void {
     Dir.cwd().deleteFile(io, mutable) catch {};
     var source_image = try vmiz.Image.openPathReadOnlyStandalone(io, source_path);
     defer source_image.close(io);
-    if (args.flavor == .core and source_image.virtual_size != core_virtual_size)
+    if (args.flavor.freshRoot() and source_image.virtual_size != core_virtual_size)
         return error.UnexpectedCoreSubstrateSize;
     if (args.size < source_image.virtual_size) return error.ImageTooSmall;
     var mutable_image = try vmiz.Image.createExclusive(
@@ -2813,6 +3174,11 @@ pub fn main(init: std.process.Init) !void {
             },
         );
     }
+    const authorized_key: ?[]u8 = if (args.authorized_key) |path|
+        try readAuthorizedKey(allocator, io, path)
+    else
+        null;
+    defer if (authorized_key) |key| allocator.free(key);
     var debz_customization = try customizeRootWithDebz(
         allocator,
         io,
@@ -2824,6 +3190,7 @@ pub fn main(init: std.process.Init) !void {
         args.vmizinit,
         args.azagent,
         args.proxy,
+        authorized_key,
     );
     defer debz_customization.deinit(allocator);
 
@@ -2914,14 +3281,16 @@ pub fn main(init: std.process.Init) !void {
     const final_lock = try final_root.filesystem.read(allocator, "/var/lib/vmiz/ubuntu2604-package-lock.tsv", 4 * 1024 * 1024);
     defer allocator.free(final_lock);
     try validateExactLockRuntime(allocator, final_lock, profile, args.flavor);
-    if (args.flavor == .core) try validateCoreRoot(
+    if (args.flavor.freshRoot()) try validateCoreRoot(
         allocator,
         io,
         &final_root.filesystem,
         profile,
+        args.flavor,
         debz_customization.evidence[0..debz_customization.evidence_count],
     );
     if (try peMachine(signed.bytes) != profile.pe_machine) return error.WrongUkiArchitecture;
+    if (args.raw_output) |raw_path| try writeRawCopy(allocator, io, output, raw_path);
     try writeSigningProvenance(
         allocator,
         io,
@@ -2960,10 +3329,12 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-fn findAzureKernelRelease(listing: []const u8) ?[]const u8 {
+/// The `/boot` scan that `extractNativeBootInputs` performs, separated so it
+/// can be tested without a built image.
+fn findKernelRelease(listing: []const u8, suffix: []const u8) ?[]const u8 {
     var lines = std.mem.splitScalar(u8, listing, '\n');
     while (lines.next()) |line| {
-        if (std.mem.startsWith(u8, line, "vmlinuz-") and std.mem.endsWith(u8, line, "-azure"))
+        if (std.mem.startsWith(u8, line, "vmlinuz-") and std.mem.endsWith(u8, line, suffix))
             return line["vmlinuz-".len..];
     }
     return null;
@@ -3465,6 +3836,46 @@ test "native image conversion round trips and cleans failed publication stages" 
     try std.testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, staged, .{}));
 }
 
+test "the raw copy is the same guest bytes, published only once complete" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_length = try temporary.dir.realPath(io, &root_buffer);
+    const root = root_buffer[0..root_length];
+    const seed_path = try std.fs.path.join(allocator, &.{ root, "seed.raw" });
+    defer allocator.free(seed_path);
+    const qcow_path = try std.fs.path.join(allocator, &.{ root, "image.qcow2" });
+    defer allocator.free(qcow_path);
+    const raw_path = try std.fs.path.join(allocator, &.{ root, "image.raw" });
+    defer allocator.free(raw_path);
+
+    var seed = try vmiz.Image.create(io, seed_path, .raw, 1024 * 1024, .{});
+    try seed.pwrite(io, "written-to-a-disk", 8192);
+    seed.close(io);
+    try copyNativeImage(allocator, io, seed_path, qcow_path, .qcow2);
+
+    try writeRawCopy(allocator, io, qcow_path, raw_path);
+    var raw = try vmiz.Image.openPathReadOnly(io, raw_path);
+    defer raw.close(io);
+    try std.testing.expectEqual(ImageFormat.raw, raw.format);
+    try std.testing.expectEqual(@as(u64, 1024 * 1024), raw.virtual_size);
+    var bytes: [17]u8 = undefined;
+    try std.testing.expectEqual(bytes.len, try raw.pread(io, &bytes, 8192));
+    try std.testing.expectEqualStrings("written-to-a-disk", &bytes);
+
+    // A failed copy leaves nothing at the published name: the next step writes
+    // whatever is there straight onto a disk.
+    const blocked = try std.fs.path.join(allocator, &.{ root, "blocked" });
+    defer allocator.free(blocked);
+    try Dir.cwd().createDirPath(io, blocked);
+    try std.testing.expectError(error.IsDir, writeRawCopy(allocator, io, qcow_path, blocked));
+    const staged_raw = try std.fmt.allocPrint(allocator, "{s}.vmiz-raw-stage", .{blocked});
+    defer allocator.free(staged_raw);
+    try std.testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, staged_raw, .{}));
+}
+
 test "arguments accept Ubuntu and project architecture spellings" {
     try std.testing.expectEqual(Architecture.x86_64, (try parseArgs(&.{ "--architecture", "amd64" })).architecture.?);
     try std.testing.expectEqual(Architecture.aarch64, (try parseArgs(&.{ "--architecture", "aarch64" })).architecture.?);
@@ -3502,6 +3913,95 @@ test "flavor defaults preserve full names and isolate core outputs" {
         ".scratch/ubuntu2604-aarch64-core",
         profileFor(.aarch64).workDirFor(.core),
     );
+}
+
+test "bare metal is named apart from core and requires exactly one administrator key" {
+    // A key is the only way into a bare-metal image. Building one without a key
+    // produces a machine nobody can reach; offering a key to a flavor that
+    // refuses to bake it would let the caller believe otherwise.
+    const baremetal_args = try parseArgs(&.{ "--flavor", "baremetal", "--authorized-key", "id_ed25519.pub" });
+    try std.testing.expectEqual(Flavor.baremetal, baremetal_args.flavor);
+    try std.testing.expectEqual(baremetal_virtual_size, baremetal_args.size);
+    try std.testing.expectError(
+        error.AuthorizedKeyRequired,
+        parseArgs(&.{ "--flavor", "baremetal" }),
+    );
+    try std.testing.expectError(
+        error.AuthorizedKeyNotSupported,
+        parseArgs(&.{ "--flavor", "core", "--authorized-key", "id_ed25519.pub" }),
+    );
+    try std.testing.expectError(
+        error.AuthorizedKeyNotSupported,
+        parseArgs(&.{ "--authorized-key", "id_ed25519.pub" }),
+    );
+
+    // The bare-metal artifact never shares a name or a scratch directory with
+    // core: they differ by kernel, and a stale one of either would be
+    // indistinguishable from a fresh build of the other.
+    try std.testing.expectEqualStrings(
+        "Ubuntu-26.04-aarch64.baremetal.qcow2",
+        profileFor(.aarch64).outputFor(.baremetal),
+    );
+    try std.testing.expectEqualStrings(
+        ".scratch/ubuntu2604-aarch64-baremetal",
+        profileFor(.aarch64).workDirFor(.baremetal),
+    );
+
+    // The flavor's structural claims, stated once so a later edit cannot
+    // quietly reverse them.
+    try std.testing.expect(Flavor.baremetal.freshRoot());
+    try std.testing.expect(!Flavor.baremetal.azure());
+    try std.testing.expect(Flavor.core.azure());
+    try std.testing.expectEqualStrings(nvidia_bos_kernel_suffix, Flavor.baremetal.kernelSuffix());
+    try std.testing.expectEqualStrings(azure_kernel_suffix, Flavor.core.kernelSuffix());
+}
+
+test "an administrator key is read only when it is one public key" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    const dir_path = try std.fs.path.join(allocator, &.{ cwd, ".scratch/ubuntu-authorized-key" });
+    defer allocator.free(dir_path);
+    Io.Dir.cwd().deleteTree(io, dir_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_path) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_path);
+
+    const write = struct {
+        fn file(a: Allocator, i: Io, directory: []const u8, name: []const u8, contents: []const u8) ![]u8 {
+            const path = try std.fs.path.join(a, &.{ directory, name });
+            try Io.Dir.cwd().writeFile(i, .{ .sub_path = path, .data = contents });
+            return path;
+        }
+    };
+
+    const good = try write.file(allocator, io, dir_path, "id.pub", "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA g@example\n");
+    defer allocator.free(good);
+    const key = try readAuthorizedKey(allocator, io, good);
+    defer allocator.free(key);
+    // Read back without the trailing newline, so the caller can place it in a
+    // file whose format it controls rather than inheriting whatever the source
+    // file happened to end with.
+    try std.testing.expectEqualStrings("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA g@example", key);
+
+    // A private key is the mistake worth catching: the paths differ by four
+    // characters and the consequence of baking the wrong one is severe.
+    const private = try write.file(allocator, io, dir_path, "id", "-----BEGIN OPENSSH PRIVATE KEY-----\nb3Blbn\n-----END OPENSSH PRIVATE KEY-----\n");
+    defer allocator.free(private);
+    try std.testing.expectError(error.InvalidAuthorizedKey, readAuthorizedKey(allocator, io, private));
+
+    // Two keys in one file would silently authorize a second party.
+    const two = try write.file(allocator, io, dir_path, "two.pub", "ssh-ed25519 AAAA a@b\nssh-ed25519 BBBB c@d\n");
+    defer allocator.free(two);
+    try std.testing.expectError(error.InvalidAuthorizedKey, readAuthorizedKey(allocator, io, two));
+
+    const empty = try write.file(allocator, io, dir_path, "empty.pub", "\n");
+    defer allocator.free(empty);
+    try std.testing.expectError(error.InvalidAuthorizedKey, readAuthorizedKey(allocator, io, empty));
+
+    const missing = try std.fs.path.join(allocator, &.{ dir_path, "absent.pub" });
+    defer allocator.free(missing);
+    try std.testing.expectError(error.AuthorizedKeyMissing, readAuthorizedKey(allocator, io, missing));
 }
 
 test "UKI signing configuration supports local and external modes exclusively" {
@@ -3617,12 +4117,110 @@ test "signed checksum entries bind exact filenames and digests" {
     ));
 }
 
-test "Azure kernel discovery is architecture-neutral and exact" {
+test "kernel discovery is architecture-neutral, exact, and flavor-driven" {
     try std.testing.expectEqualStrings(
         "7.0.0-1001-azure",
-        findAzureKernelRelease("config\nvmlinuz-7.0.0-1001-azure\n").?,
+        findKernelRelease("config\nvmlinuz-7.0.0-1001-azure\n", azure_kernel_suffix).?,
     );
-    try std.testing.expect(findAzureKernelRelease("vmlinuz-7.0.0-28-generic\n") == null);
+    try std.testing.expect(findKernelRelease("vmlinuz-7.0.0-28-generic\n", azure_kernel_suffix) == null);
+
+    // The point of the suffix being a parameter: the Azure kernel is not an
+    // acceptable substitute for the bare-metal one, or the other way around.
+    const nvidia_listing = "config\nvmlinuz-7.0.0-2015-nvidia-bos-64k\n";
+    try std.testing.expectEqualStrings(
+        baremetal_kernel_release,
+        findKernelRelease(nvidia_listing, nvidia_bos_kernel_suffix).?,
+    );
+    try std.testing.expect(findKernelRelease(nvidia_listing, azure_kernel_suffix) == null);
+    try std.testing.expect(
+        findKernelRelease("vmlinuz-7.0.0-1001-azure\n", nvidia_bos_kernel_suffix) == null,
+    );
+}
+
+test "the bare-metal initramfs is required to carry the drivers that reach the machine" {
+    const allocator = std.testing.allocator;
+
+    // An initramfs as initramfs-tools builds one: an uncompressed early cpio,
+    // then the compressed main archive. Both halves are searched, because
+    // which half a module lands in is not this builder's decision.
+    const pack = struct {
+        fn archive(a: Allocator, paths: []const []const u8) ![]u8 {
+            var buffer = std.array_list.Managed(u8).init(a);
+            errdefer buffer.deinit();
+            var writer = vmiz.cpio.Writer.init(&buffer, .newc);
+            for (paths) |path| try writer.append(.{
+                .path = path,
+                .content = "module",
+                .metadata = .{ .mode = 0o100644, .nlink = 1 },
+            });
+            try writer.finish();
+            return buffer.toOwnedSlice();
+        }
+
+        fn image(a: Allocator, early: []const []const u8, payload: []const []const u8) ![]u8 {
+            const early_bytes = try archive(a, early);
+            defer a.free(early_bytes);
+            const main_bytes = try archive(a, payload);
+            defer a.free(main_bytes);
+            var out: std.Io.Writer.Allocating = .init(a);
+            errdefer out.deinit();
+            try out.writer.writeAll(early_bytes);
+            try vmiz.zstd.writeRawFrameForSlice(&out.writer, main_bytes, null);
+            return out.toOwnedSlice();
+        }
+    };
+
+    const complete = try pack.image(
+        allocator,
+        &.{"kernel/drivers/net/usb/r8152.ko.zst"},
+        &.{ "kernel/drivers/nvme/host/nvme.ko.zst", "kernel/fs/ext4/ext4.ko.zst" },
+    );
+    defer allocator.free(complete);
+    try requireInitramfsModules(allocator, complete, &baremetal_required_initramfs_modules);
+
+    // The failure this exists to catch: an initramfs built the way an Azure
+    // image's would be, carrying neither the disk nor the NIC this machine has.
+    const azure_shaped = try pack.image(
+        allocator,
+        &.{},
+        &.{ "kernel/drivers/net/hyperv/hv_netvsc.ko.zst", "kernel/drivers/scsi/sd_mod.ko.zst" },
+    );
+    defer allocator.free(azure_shaped);
+    try std.testing.expectError(
+        error.InitramfsModuleMissing,
+        requireInitramfsModules(allocator, azure_shaped, &baremetal_required_initramfs_modules),
+    );
+
+    // Half of it is still a machine that does not come back: root without a
+    // network is as unreachable as a network without root.
+    const no_nic = try pack.image(allocator, &.{}, &.{"kernel/drivers/nvme/host/nvme.ko.zst"});
+    defer allocator.free(no_nic);
+    try std.testing.expectError(
+        error.InitramfsModuleMissing,
+        requireInitramfsModules(allocator, no_nic, &baremetal_required_initramfs_modules),
+    );
+
+    // A name that merely contains a required one is not that module.
+    const near_miss = try pack.image(
+        allocator,
+        &.{},
+        &.{ "kernel/drivers/nvme/host/nvme-core.ko.zst", "kernel/drivers/net/usb/r8152.ko.zst" },
+    );
+    defer allocator.free(near_miss);
+    try std.testing.expectError(
+        error.InitramfsModuleMissing,
+        requireInitramfsModules(allocator, near_miss, &baremetal_required_initramfs_modules),
+    );
+
+    // An image whose compressed half cannot be read fails closed rather than
+    // reporting the modules it could not look for as absent-but-fine.
+    var truncated = try allocator.dupe(u8, complete);
+    defer allocator.free(truncated);
+    @memset(truncated[truncated.len - 16 ..], 0);
+    try std.testing.expectError(
+        error.UnreadableInitramfs,
+        requireInitramfsModules(allocator, truncated[0 .. truncated.len - 8], &baremetal_required_initramfs_modules),
+    );
 }
 
 test "UKI cmdline binds final root PARTUUID and native serial console" {
@@ -3654,6 +4252,21 @@ test "UKI cmdline binds final root PARTUUID and native serial console" {
         core_cmdline,
     );
     try std.testing.expect(std.mem.indexOf(u8, core_cmdline, "vmizinit.shell=on") == null);
+
+    const baremetal_cmdline = try ukiCmdline(
+        std.testing.allocator,
+        root_guid,
+        profileFor(.aarch64),
+        .baremetal,
+    );
+    defer std.testing.allocator.free(baremetal_cmdline);
+    try std.testing.expectEqualStrings(
+        "root=PARTUUID=11111111-2222-3333-4444-555555555555 init=/sbin/vmizinit vmizinit.mode=persistent vmizinit.azure=off console=tty0 console=ttyAMA0,115200n8",
+        baremetal_cmdline,
+    );
+    // `auto` would send the machine looking for an Azure it is never going to
+    // find; `off` is the whole point of the flavor.
+    try std.testing.expect(std.mem.indexOf(u8, baremetal_cmdline, "vmizinit.azure=auto") == null);
 }
 
 test "native boot validation rejects missing modules.dep and initramfs" {

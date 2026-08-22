@@ -22,6 +22,14 @@ const Ubuntu2604Architecture = enum {
 const Ubuntu2604Flavor = enum {
     core,
     full,
+    baremetal,
+
+    /// Whether the flavor needs the static guest binaries built alongside the
+    /// image. Bare metal is core aimed at a physical machine, so it runs the
+    /// same PID 1.
+    fn needsGuestArtifacts(self: Ubuntu2604Flavor) bool {
+        return self != .full;
+    }
 };
 
 pub const ImageFormat = image_build.Format;
@@ -146,7 +154,7 @@ pub fn build(b: *std.Build) void {
     const ubuntu2604_flavor = b.option(
         Ubuntu2604Flavor,
         "ubuntu2604-flavor",
-        "Ubuntu 26.04 guest flavor: full (default, cloud-init/systemd) or core (vmizinit/azagent)",
+        "Ubuntu 26.04 guest flavor: full (default, cloud-init/systemd), core (vmizinit/azagent), or baremetal (core on a physical machine)",
     ) orelse .full;
     const bzip2z = b.dependency("bzip2z", .{
         .target = target,
@@ -1125,11 +1133,11 @@ pub fn build(b: *std.Build) void {
             .root_module = ubuntu2604_builder_mod,
         });
         b.installArtifact(ubuntu2604_builder_exe);
-        const ubuntu2604_core_x86_64 = if (ubuntu2604_flavor == .core)
+        const ubuntu2604_core_x86_64 = if (ubuntu2604_flavor.needsGuestArtifacts())
             addUbuntu2604CoreArtifacts(b, .x86_64)
         else
             null;
-        const ubuntu2604_core_aarch64 = if (ubuntu2604_flavor == .core)
+        const ubuntu2604_core_aarch64 = if (ubuntu2604_flavor.needsGuestArtifacts())
             addUbuntu2604CoreArtifacts(b, .aarch64)
         else
             null;

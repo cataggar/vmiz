@@ -1149,12 +1149,22 @@ pub const Root = struct {
         try self.writeFile(.{ .path = guest_path, .source = .{ .host_path = host_path }, .mode = mode });
     }
 
-    pub fn activeKernelRelease(self: *Root) ![]u8 {
+    /// The release named by `/boot/vmlinuz`, required to be the kernel flavor
+    /// the caller asked for.
+    ///
+    /// The suffix is a parameter rather than a constant because which kernel
+    /// is the right one is a property of the image being built, not of this
+    /// library: an Azure image must boot `-azure`, and an image for a
+    /// particular machine must boot the kernel that machine's hardware is
+    /// supported by. Accepting whatever happens to be in `/boot` would let a
+    /// wrong kernel through silently, which is the failure this check exists
+    /// to prevent.
+    pub fn activeKernelRelease(self: *Root, suffix: []const u8) ![]u8 {
         const target = try self.readLink("/boot/vmlinuz");
         defer self.allocator.free(target);
         const name = std.fs.path.basename(target);
-        if (!std.mem.startsWith(u8, name, "vmlinuz-") or !std.mem.endsWith(u8, name, "-azure"))
-            return error.AzureKernelMissing;
+        if (!std.mem.startsWith(u8, name, "vmlinuz-") or !std.mem.endsWith(u8, name, suffix))
+            return error.ExpectedKernelMissing;
         return self.allocator.dupe(u8, name["vmlinuz-".len..]);
     }
 
